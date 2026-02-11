@@ -11,11 +11,16 @@ from typing import List, Dict, Tuple, Optional, Any
 
 
 class GMS2ProjectParser:
-    """Парсер для проектов GameMaker Studio 2"""
-    
+    """Parser for GameMaker Studio 2 projects"""
+
     def __init__(self, project_path: str):
         self.project_path = project_path
         self.project_gml_files_details = []  # (display_name, gml_path, relative_path, asset_yy_path)
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Normalize path separators to forward slashes for consistent output."""
+        return path.replace('\\', '/')
         
     def scan_project(self) -> Dict[str, Any]:
         """Сканирует проект и возвращает структуру файлов"""
@@ -134,7 +139,7 @@ class GMS2ProjectParser:
                     display_name = f"{parent_asset_name} / {gml_name}"
                     
                     self.project_gml_files_details.append((
-                        display_name, file_path, relative_path, asset_yy_path
+                        display_name, file_path, self._normalize_path(relative_path), asset_yy_path
                     ))
     
     def get_gml_content(self, file_path: str) -> Dict[str, Any]:
@@ -148,7 +153,7 @@ class GMS2ProjectParser:
                 
             return {
                 "file_path": file_path,
-                "relative_path": os.path.relpath(file_path, self.project_path),
+                "relative_path": self._normalize_path(os.path.relpath(file_path, self.project_path)),
                 "content": content,
                 "line_count": len(content.splitlines())
             }
@@ -239,6 +244,217 @@ class GMS2ProjectParser:
             
         return sprite_info
     
+    def duplicate_object(self, source_name: str, new_name: str,
+                         property_overrides: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Duplicates a GMS2 object with a new name and optional property changes."""
+        source_path = os.path.join(self.project_path, "objects", source_name)
+        new_path = os.path.join(self.project_path, "objects", new_name)
+
+        if not os.path.isdir(source_path):
+            return {"error": f"Source object not found: {source_name}"}
+        if os.path.exists(new_path):
+            return {"error": f"Object already exists: {new_name}"}
+
+        try:
+            os.makedirs(new_path)
+
+            # Copy and rename .yy metadata file
+            source_yy = os.path.join(source_path, f"{source_name}.yy")
+            new_yy = os.path.join(new_path, f"{new_name}.yy")
+
+            if os.path.isfile(source_yy):
+                with open(source_yy, 'r', encoding='utf-8') as f:
+                    yy_content = f.read()
+
+                # Replace this object's name references (other object refs stay intact)
+                yy_content = yy_content.replace(f'"{source_name}"', f'"{new_name}"')
+                yy_content = yy_content.replace(
+                    f'{source_name}/{source_name}.yy',
+                    f'{new_name}/{new_name}.yy',
+                )
+
+                # Apply property value overrides
+                if property_overrides:
+                    for prop_name, new_value in property_overrides.items():
+                        # Each property is on one line with "name" and "value" fields
+                        pattern = (
+                            rf'("name":"{re.escape(prop_name)}"'
+                            rf'.*?"value":)"([^"]*)"'
+                        )
+                        yy_content = re.sub(pattern, rf'\1"{new_value}"', yy_content)
+
+                with open(new_yy, 'w', encoding='utf-8') as f:
+                    f.write(yy_content)
+
+            # Copy all .gml event files
+            copied_gml = []
+            for filename in sorted(os.listdir(source_path)):
+                if filename.endswith('.gml'):
+                    with open(os.path.join(source_path, filename), 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    with open(os.path.join(new_path, filename), 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    copied_gml.append(filename)
+
+            # Register in the .yyp project file
+            registered = self._register_resource_in_yyp(new_name, "objects")
+
+            return {
+                "source": source_name,
+                "new_name": new_name,
+                "new_path": self._normalize_path(new_path),
+                "yy_file": self._normalize_path(new_yy),
+                "gml_files": copied_gml,
+                "registered_in_yyp": registered,
+                "property_overrides": property_overrides or {},
+            }
+        except Exception as e:
+            # Clean up partial creation on failure
+            import shutil
+            if os.path.isdir(new_path):
+                shutil.rmtree(new_path)
+            return {"error": f"Failed to duplicate object: {e}"}
+
+    def _register_resource_in_yyp(self, asset_name: str, category: str) -> bool:
+        """Adds a resource entry to the .yyp project file."""
+        yyp_files = [f for f in os.listdir(self.project_path) if f.endswith('.yyp')]
+        if not yyp_files:
+            return False
+
+        yyp_path = os.path.join(self.project_path, yyp_files[0])
+        with open(yyp_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        new_entry = (
+            f'    {{"id":{{"name":"{asset_name}",'
+            f'"path":"{category}/{asset_name}/{asset_name}.yy",}},}},'
+        )
+
+        # Insert before the closing of the resources array
+        match = re.search(r'("resources":\[.*?)(\n\s*\],)', content, re.DOTALL)
+        if not match:
+            return False
+
+        insert_pos = match.end(1)
+        content = content[:insert_pos] + '\n' + new_entry + content[insert_pos:]
+
+        with open(yyp_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
+
+    def add_room_instance(self, room_name: str, object_name: str,
+                          x: float, y: float,
+                          scale_x: float = 1.0, scale_y: float = 1.0,
+                          rotation: float = 0.0,
+                          layer_name: str = "Instances",
+                          property_overrides: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Adds an object instance to a room at the given position."""
+        import uuid
+
+        room_yy = os.path.join(self.project_path, "rooms", room_name, f"{room_name}.yy")
+        if not os.path.isfile(room_yy):
+            return {"error": f"Room not found: {room_name}"}
+
+        obj_yy_rel = f"objects/{object_name}/{object_name}.yy"
+        obj_yy_abs = os.path.join(self.project_path, obj_yy_rel)
+        if not os.path.isfile(obj_yy_abs):
+            return {"error": f"Object not found: {object_name}"}
+
+        inst_id = f"inst_{uuid.uuid4().hex[:8].upper()}"
+
+        # Build overridden properties if provided
+        props_json = "[]"
+        if property_overrides:
+            entries = []
+            for pname, pval in property_overrides.items():
+                entries.append(
+                    f'{{"$GMOverriddenProperty":"v1","%Name":"","name":"",'
+                    f'"objectId":{{"name":"{object_name}","path":"{obj_yy_rel}",}},'
+                    f'"propertyId":{{"name":"{pname}","path":"{obj_yy_rel}",}},'
+                    f'"resourceType":"GMOverriddenProperty","resourceVersion":"2.0",'
+                    f'"value":"{pval}",}}'
+                )
+            props_json = "[\n            " + ",\n            ".join(entries) + ",\n          ]"
+
+        instance_line = (
+            f'{{"$GMRInstance":"v4","%Name":"{inst_id}",'
+            f'"colour":4294967295,"frozen":false,"hasCreationCode":false,'
+            f'"ignore":false,"imageIndex":0,"imageSpeed":1.0,'
+            f'"inheritCode":false,"inheritedItemId":null,"inheritItemSettings":false,'
+            f'"isDnd":false,"name":"{inst_id}",'
+            f'"objectId":{{"name":"{object_name}","path":"{obj_yy_rel}",}},'
+            f'"properties":{props_json},'
+            f'"resourceType":"GMRInstance","resourceVersion":"2.0",'
+            f'"rotation":{rotation},"scaleX":{scale_x},"scaleY":{scale_y},'
+            f'"x":{x},"y":{y},}}'
+        )
+
+        try:
+            with open(room_yy, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # Insert instance into the target layer's instances array.
+            # The array closes with: ],"layers":[],"name":"{layer_name}"
+            layer_close = rf'(\n\s*)\],"layers":\[\],"name":"{re.escape(layer_name)}"'
+            match = re.search(layer_close, content)
+            if not match:
+                return {"error": f"Layer '{layer_name}' not found in room '{room_name}'"}
+
+            insert_pos = match.start()
+            content = content[:insert_pos] + f"\n        {instance_line}," + content[insert_pos:]
+
+            # Insert into instanceCreationOrder
+            ico_entry = f'    {{"name":"{inst_id}","path":"rooms/{room_name}/{room_name}.yy",}},'
+            ico_match = re.search(r'("instanceCreationOrder":\[.*?)(\n\s*\],)', content, re.DOTALL)
+            if ico_match:
+                pos = ico_match.end(1)
+                content = content[:pos] + '\n' + ico_entry + content[pos:]
+
+            with open(room_yy, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            return {
+                "instance_id": inst_id,
+                "room_name": room_name,
+                "object_name": object_name,
+                "layer": layer_name,
+                "position": {"x": x, "y": y},
+                "scale": {"x": scale_x, "y": scale_y},
+                "rotation": rotation,
+                "property_overrides": property_overrides or {},
+            }
+        except Exception as e:
+            return {"error": f"Failed to add instance: {e}"}
+
+    def write_gml_file(self, file_path: str, content: str) -> Dict[str, Any]:
+        """Writes content to a GML file within the project."""
+        # Resolve relative paths against the project root
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(self.project_path, file_path)
+
+        # Safety: ensure the target is inside the project directory
+        abs_project = os.path.abspath(self.project_path)
+        abs_file = os.path.abspath(file_path)
+        if not abs_file.startswith(abs_project + os.sep) and abs_file != abs_project:
+            return {"error": f"Cannot write outside project directory: {file_path}"}
+
+        if not file_path.endswith('.gml'):
+            return {"error": f"Only .gml files can be written: {file_path}"}
+
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            return {
+                "file_path": file_path,
+                "relative_path": self._normalize_path(os.path.relpath(file_path, self.project_path)),
+                "line_count": len(content.splitlines()),
+                "char_count": len(content),
+            }
+        except Exception as e:
+            return {"error": f"Error writing file {file_path}: {e}"}
+
     def export_all_data(self) -> str:
         """Экспортирует все данные проекта в текстовый формат"""
         if not self.project_gml_files_details:
@@ -271,7 +487,7 @@ class GMS2ProjectParser:
             
             # Экспортируем связанный YY файл
             if asset_yy_path and os.path.isfile(asset_yy_path) and asset_yy_path not in exported_yy_files:
-                relative_yy_path = os.path.relpath(asset_yy_path, self.project_path)
+                relative_yy_path = self._normalize_path(os.path.relpath(asset_yy_path, self.project_path))
                 asset_name = os.path.basename(os.path.dirname(asset_yy_path))
                 
                 output_lines.append(f"// ----- Associated YY File: {asset_name} -----")
